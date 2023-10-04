@@ -469,13 +469,13 @@ static int _logger_parse_prx_errbe(logentry *e, char *scratch) {
                 "ts=%lld.%d gid=%llu type=proxy_backend error=%.*s name=%.*s port=%.*s label=%.*s retry=%d\n",
                 (long long int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
                 (int)le->errlen, errmsg, (int)le->be_namelen, be_name,
-                (int)le->be_portlen, be_port, be_label, le->retry);
+                (int)le->be_portlen, be_port, (int)le->be_labellen, be_label, le->retry);
     } else {
         total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
                 "ts=%lld.%d gid=%llu type=proxy_backend error=%.*s name=%.*s port=%.*s label=%.*s depth=%d rbuf=%s\n",
                 (long long int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
                 (int)le->errlen, errmsg, (int)le->be_namelen, be_name,
-                (int)le->be_portlen, be_port, be_label, le->be_depth, rbuf);
+                (int)le->be_portlen, be_port, (int)le->be_labellen, be_label, le->be_depth, rbuf);
     }
 
     return total;
