@@ -441,7 +441,7 @@ static void _logger_log_proxy_errbe(logentry *e, const entry_details *d, const v
     memcpy(data, be_port, le->be_portlen);
     data += le->be_portlen;
     memcpy(data, be_label, le->be_labellen);
-    data += le->be-labellen;
+    data += le->be_labellen;
     memcpy(data, be_rbuf, le->be_rbuflen);
     data += le->be_rbuflen;
 
