@@ -17,6 +17,7 @@
 #include "storage.h"
 #include "authfile.h"
 #include "restart.h"
+#include "slabs_mover.h"
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -107,8 +108,6 @@ struct settings settings;
 time_t process_started;     /* when the process was started */
 conn **conns;
 
-struct slab_rebalance slab_rebal;
-volatile int slab_rebalance_signal;
 #ifdef EXTSTORE
 /* hoping this is temporary; I'd prefer to cut globals, but will complete this
  * battle another day.
@@ -6033,7 +6032,6 @@ int main (int argc, char **argv) {
     }
 #endif
 #ifdef EXTSTORE
-    slabs_set_storage(storage);
     memcached_thread_init(settings.num_threads, storage);
     init_lru_crawler(storage);
 #else
@@ -6075,9 +6073,11 @@ int main (int argc, char **argv) {
         return 1;
     }
 
-    if (settings.slab_reassign &&
-        start_slab_maintenance_thread() == -1) {
-        exit(EXIT_FAILURE);
+    if (settings.slab_reassign) {
+        settings.slab_rebal = start_slab_maintenance_thread(storage);
+        if (!settings.slab_rebal) {
+            exit(EXIT_FAILURE);
+        }
     }
 
     if (settings.idle_timeout && start_conn_timeout_thread() == -1) {

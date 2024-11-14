@@ -405,7 +405,7 @@ static void recache_or_free(io_pending_t *pending) {
         // item header alone.
         do_free = false;
         size_t ntotal = ITEM_ntotal(p->hdr_it);
-        slabs_free(it, ntotal, slabs_clsid(ntotal));
+        slabs_free(it, slabs_clsid(ntotal));
 
         io_queue_t *q = conn_io_queue_get(c, p->io_queue_type);
         q->count--;
@@ -418,7 +418,7 @@ static void recache_or_free(io_pending_t *pending) {
         do_free = false;
         size_t ntotal = ITEM_ntotal(p->hdr_it);
         item_unlink(p->hdr_it);
-        slabs_free(it, ntotal, slabs_clsid(ntotal));
+        slabs_free(it, slabs_clsid(ntotal));
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.miss_from_extstore++;
         if (p->badcrc)
@@ -453,7 +453,7 @@ static void recache_or_free(io_pending_t *pending) {
             item_trylock_unlock(hold_lock);
     }
     if (do_free)
-        slabs_free(it, ITEM_ntotal(it), ITEM_clsid(it));
+        slabs_free(it, ITEM_clsid(it));
 
     p->io_ctx.buf = NULL;
     p->io_ctx.next = NULL;
@@ -575,7 +575,7 @@ static int storage_write(void *storage, const int clsid, const int item_age) {
                 LOGGER_LOG(NULL, LOG_EVICTIONS, LOGGER_EXTSTORE_WRITE, it, bucket);
             } else {
                 /* Failed to write for some reason, can't continue. */
-                slabs_free(hdr_it, ITEM_ntotal(hdr_it), ITEM_clsid(hdr_it));
+                slabs_free(hdr_it, ITEM_clsid(hdr_it));
             }
         }
     }

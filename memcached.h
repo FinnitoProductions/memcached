@@ -46,6 +46,7 @@
 #endif
 
 #include "itoa_ljust.h"
+#include "slabs_mover.h"
 #include "protocol_binary.h"
 #include "cache.h"
 #include "logger.h"
@@ -507,6 +508,7 @@ struct settings {
     bool drop_privileges;   /* Whether or not to drop unnecessary process privileges */
     bool watch_enabled; /* allows watch commands to be dropped */
     bool relaxed_privileges;   /* Relax process restrictions when running testapp */
+    struct slab_rebal_thread *slab_rebal; /* struct for page mover thread */
 #ifdef EXTSTORE
     unsigned int ext_io_threadcount; /* number of IO threads to run. */
     unsigned int ext_page_size; /* size in megabytes of storage pages. */
@@ -918,27 +920,6 @@ extern volatile bool is_paused;
 extern volatile int64_t delta;
 #endif
 
-/* TODO: Move to slabs.h? */
-extern volatile int slab_rebalance_signal;
-
-struct slab_rebalance {
-    void *slab_start;
-    void *slab_end;
-    void *slab_pos;
-    int s_clsid;
-    int d_clsid;
-    uint32_t busy_items;
-    uint32_t rescues;
-    uint32_t evictions_nomem;
-    uint32_t inline_reclaim;
-    uint32_t chunk_rescues;
-    uint32_t busy_deletes;
-    uint32_t busy_loops;
-    uint8_t done;
-    uint8_t *completed;
-};
-
-extern struct slab_rebalance slab_rebal;
 #ifdef EXTSTORE
 extern void *ext_storage;
 #endif
