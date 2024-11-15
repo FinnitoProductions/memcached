@@ -4,6 +4,10 @@
 
 #include "memcached.h"
 #include "slabs_mover.h"
+#include "slab_automove.h"
+#ifdef EXTSTORE
+#include "slab_automove_extstore.h"
+#endif
 #include "storage.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -44,6 +48,10 @@ struct slab_rebal_thread {
     pthread_mutex_t lock;
     pthread_cond_t cond;
     pthread_t tid;
+    unsigned int am_version; // re-generate am object if version changes
+    struct timespec am_last; // last time automover algo ran
+    slab_automove_reg_t *sam; // active algorithm module
+    void *active_am; // automover memory
     struct slab_rebalance rebal;
 };
 
@@ -52,7 +60,22 @@ enum move_status {
     MOVE_BUSY_UPLOADING, MOVE_BUSY_ACTIVE, MOVE_LOCKED
 };
 
+static slab_automove_reg_t slab_automove_default = {
+    .init = slab_automove_init,
+    .free = slab_automove_free,
+    .run = slab_automove_run
+};
+#ifdef EXTSTORE
+static slab_automove_reg_t slab_automove_extstore = {
+    .init = slab_automove_extstore_init,
+    .free = slab_automove_extstore_free,
+    .run = slab_automove_extstore_run
+};
+#endif
+
+// FIXME: delete if unused
 #define SLAB_MOVE_MAX_LOOPS 1000
+static enum reassign_result_type do_slabs_reassign(struct slab_rebal_thread *t, int src, int dst);
 
 static int slab_rebalance_start(struct slab_rebal_thread *t) {
     uint32_t size;
@@ -483,6 +506,47 @@ static void slab_rebalance_finish(struct slab_rebal_thread *t) {
     memset(&t->rebal, 0, sizeof(t->rebal));
 }
 
+static int slab_rebalance_check_automove(struct slab_rebal_thread *t,
+        struct timespec *now) {
+    int src, dst;
+    if (settings.slab_automove == 0) {
+        // not enabled
+        return 0;
+    }
+
+    if (t->am_last.tv_sec == now->tv_sec) {
+        // run once per second-ish.
+        return 0;
+    }
+
+    if (settings.slab_automove_version != t->am_version) {
+        void *am_new = t->sam->init(&settings);
+        // only replace if we successfully re-init'ed
+        if (am_new) {
+            t->sam->free(t->active_am);
+            t->active_am = am_new;
+        }
+        t->am_version = settings.slab_automove_version;
+    }
+
+    t->sam->run(t->active_am, &src, &dst);
+    if (src != -1 && dst != -1) {
+        // rebalancer lock already held, call directly.
+        do_slabs_reassign(t, src, dst);
+        // TODO: need logger instance
+        // TODO: log the _result_ of the do_slabs_reassign call as well?
+        // LOGGER_LOG(l, LOG_SYSEVENTS, LOGGER_SLAB_MOVE, NULL, src, dst);
+        if (dst != 0) {
+            // if not reclaiming to global, rate limit to one per second.
+            t->am_last.tv_sec = now->tv_sec;
+        }
+        // run the thread since we're moving a page.
+        return 1;
+    }
+
+    return 0;
+}
+
 /* Slab mover thread.
  * Sits waiting for a condition to jump off and shovel some memory about
  */
@@ -526,8 +590,14 @@ static void *slab_rebalance_thread(void *arg) {
                     backoff_timer = backoff_max;
             }
         } else {
-            // wait for signal to start another move.
-            pthread_cond_wait(&t->cond, &t->lock);
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            if (slab_rebalance_check_automove(t, &now) == 0) {
+                // standard delay
+                now.tv_sec++;
+                // wait for signal to start another move.
+                pthread_cond_timedwait(&t->cond, &t->lock, &now);
+            } // else don't wait, run again immediately.
         }
     }
 
@@ -582,6 +652,7 @@ void slab_maintenance_resume(struct slab_rebal_thread *t) {
 }
 
 struct slab_rebal_thread *start_slab_maintenance_thread(void *storage) {
+    int ret;
     struct slab_rebal_thread *t = calloc(1, sizeof(*t));
     if (t == NULL)
         return NULL;
@@ -589,8 +660,17 @@ struct slab_rebal_thread *start_slab_maintenance_thread(void *storage) {
     pthread_mutex_init(&t->lock, NULL);
     pthread_cond_init(&t->cond, NULL);
     t->run_thread = true;
-    t->storage = storage;
-    int ret;
+    if (storage) {
+        t->storage = storage;
+        t->sam = &slab_automove_extstore;
+    } else {
+        t->sam = &slab_automove_default;
+    }
+    t->active_am = t->sam->init(&settings);
+    if (t->active_am == NULL) {
+        fprintf(stderr, "Can't create slab rebalancer thread: failed to allocate automover memory\n");
+        return NULL;
+    }
 
     if ((ret = pthread_create(&t->tid, NULL,
                               slab_rebalance_thread, t)) != 0) {
@@ -617,5 +697,6 @@ void stop_slab_maintenance_thread(struct slab_rebal_thread *t) {
     if (t->rebal.completed) {
         free(t->rebal.completed);
     }
+    t->sam->free(t->active_am);
     free(t);
 }

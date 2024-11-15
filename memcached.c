@@ -257,6 +257,7 @@ static void settings_init(void) {
     settings.hashpower_init = 0;
     settings.slab_reassign = true;
     settings.slab_automove = 1;
+    settings.slab_automove_version = 0;
     settings.slab_automove_ratio = 0.8;
     settings.slab_automove_window = 30;
     settings.shutdown_command = false;

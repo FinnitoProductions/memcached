@@ -83,13 +83,13 @@ static void window_sum(struct window_data *wd, struct window_data *w,
     }
 }
 
-static int global_pool_check(slab_automove *a) {
+static int global_pool_check(slab_automove *a, unsigned int *count) {
     bool mem_limit_reached;
     unsigned int free = a->global_pool_watermark;
-    unsigned int count = global_page_pool_size(&mem_limit_reached);
+    *count = global_page_pool_size(&mem_limit_reached);
     if (!mem_limit_reached)
         return 0;
-    if (count < free) {
+    if (*count < free) {
         a->pool_filled_once = true;
         return 1;
     } else {
@@ -140,7 +140,8 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
     *src = -1;
     *dst = -1;
 
-    int global_low = global_pool_check(a);
+    unsigned int global_count = 0;
+    int global_low = global_pool_check(a, &global_count);
     // fill after structs
     fill_item_stats_automove(a->iam_after);
     fill_slab_stats_automove(a->sam_after);
@@ -171,6 +172,9 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
         // reclaim to global, if it stays this way for the whole window.
         if (a->sam_after[n].free_chunks > (free_target * 2)) {
             wd->excess_free = 1;
+        } else {
+            // not enough free chunks means we were dirty this window.
+            wd->dirty = 1;
         }
 
         // set age into window
@@ -183,11 +187,17 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
         // grab age as average of window total
         uint64_t age = w_sum.age / a->window_size;
 
-        // if > N free chunks and not dirty, reclaim memory
+        // If global page pool is completely empty we need to force a move
+        // from any possible source. Otherwise avoid moving from this class if
+        // it appears dirty.
+        if (w_sum.dirty != 0 && global_count != 0) {
+            continue;
+        }
+
+        // if > N free chunks, reclaim memory
         // small slab classes aren't age balanced and rely more on global
         // pool. reclaim them more aggressively.
-        if (a->sam_after[n].free_chunks > a->sam_after[n].chunks_per_page * MIN_PAGES_FOR_RECLAIM
-                && w_sum.dirty == 0) {
+        if (a->sam_after[n].free_chunks > a->sam_after[n].chunks_per_page * MIN_PAGES_FOR_RECLAIM) {
             if (small_slab) {
                 *src = n;
                 *dst = 0;
@@ -208,7 +218,6 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
                 oldest = n;
                 oldest_age = age;
             }
-
         }
     }
 
