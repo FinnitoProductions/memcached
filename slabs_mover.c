@@ -26,9 +26,9 @@ struct slab_rebalance {
     uint32_t cls_size;
     uint32_t busy_items;
     uint32_t rescues;
-    uint32_t evictions_nomem;
     uint32_t inline_reclaim;
     uint32_t chunk_rescues;
+    uint32_t busy_nomem;
     uint32_t busy_deletes;
     uint32_t busy_loops;
     uint8_t done;
@@ -37,7 +37,9 @@ struct slab_rebalance {
 
 struct slab_rebal_thread {
     bool run_thread;
+    bool mem_full; // all memory alloced and global pool is 0 as of start.
     void *storage; // extstore instance.
+    item *new_it; // memory for swapping out valid items.
     // TODO: logger instance.
     pthread_mutex_t lock;
     pthread_cond_t cond;
@@ -55,8 +57,22 @@ enum move_status {
 static int slab_rebalance_start(struct slab_rebal_thread *t) {
     uint32_t size;
     uint32_t perslab;
+    bool mem_limit_reached;
+
     if (t->rebal.s_clsid == t->rebal.d_clsid) {
         return -1;
+    }
+
+    // check once at the start of a page move if the global pool is full.
+    // since we're the only thing that can put memory back into the global
+    // pool, this can't change until we complete.
+    // unless the user changes the memory limit manually, which should be
+    // rare.
+    unsigned int global = global_page_pool_size(&mem_limit_reached);
+    if (mem_limit_reached && global == 0) {
+        t->mem_full = true;
+    } else {
+        t->mem_full = false;
     }
 
     void *page = slabs_peek_page(t->rebal.s_clsid, &size, &perslab);
@@ -88,19 +104,19 @@ static int slab_rebalance_start(struct slab_rebal_thread *t) {
     return 0;
 }
 
-#if 0
-static void *slab_rebalance_alloc(unsigned int id) {
-    int x;
+static void *slab_rebalance_alloc(struct slab_rebal_thread *t, unsigned int id) {
     item *new_it = NULL;
 
-    for (x = 0; x < 10; x++) {
+    // We will either wipe the whole page if unused, or run out of memory in
+    // the page and return NULL.
+    while (1) {
         new_it = slabs_alloc(id, SLABS_ALLOC_NO_NEWPAGE);
         if (new_it == NULL) {
             break;
         }
         /* check that memory isn't within the range to clear */
-        if ((void *)new_it >= slab_rebal.slab_start
-            && (void *)new_it < slab_rebal.slab_end) {
+        if ((void *)new_it >= t->rebal.slab_start
+            && (void *)new_it < t->rebal.slab_end) {
             /* Pulled something we intend to free. Mark it as freed since
              * we've already done the work of unlinking it from the freelist.
              */
@@ -110,14 +126,46 @@ static void *slab_rebalance_alloc(unsigned int id) {
             memcpy(ITEM_key(new_it), "deadbeef", 8);
 #endif
             new_it = NULL;
-            slab_rebal.inline_reclaim++;
+            t->rebal.inline_reclaim++;
         } else {
             break;
         }
     }
     return new_it;
 }
-#endif
+
+// To call move, we first need a free chunk of memory.
+// TODO: flag to indicate if the page mover was a manual request.
+// If so, always do an eviction to move forward.
+// - use t->mem_full (rename it?) unless mem_full gets used elsewhere.
+static void slab_rebalance_prep(struct slab_rebal_thread *t) {
+    unsigned int s_clsid = t->rebal.s_clsid;
+    if (t->new_it) {
+        // move didn't use the memory from the last loop.
+        return;
+    }
+
+    t->new_it = slab_rebalance_alloc(t, s_clsid);
+    // we could free the entire page in the above alloc call, but not get any
+    // other memory to work with.
+    // We try to busy-loop the page mover at least a few times in this case,
+    // so it will pick up on all of the memory being freed already.
+    if (t->new_it == NULL && t->mem_full) {
+        // global is empty and memory limit is reached. we have to evict
+        // memory to move forward.
+        for (int x = 0; x < 10; x++) {
+            if (lru_pull_tail(s_clsid, COLD_LRU, 0, LRU_PULL_EVICT, 0, NULL) <= 0) {
+                if (settings.lru_segmented) {
+                    lru_pull_tail(s_clsid, HOT_LRU, 0, 0, 0, NULL);
+                }
+            }
+            t->new_it = slab_rebalance_alloc(t, s_clsid);
+            if (t->new_it != NULL) {
+                break;
+            }
+        }
+    }
+}
 
 /* refcount == 0 is safe since nobody can incr while item_lock is held.
  * refcount != 0 is impossible since flags/etc can be modified in other
@@ -215,6 +263,63 @@ static int _slabs_locked_cb(void *arg) {
     return status;
 }
 
+static void slab_rebalance_rescue(struct slab_rebal_thread *t, struct _locked_st *a) {
+    int cls_size = t->rebal.cls_size;
+    item *it = a->it;
+    item_chunk *ch = a->ch;
+    item *new_it = t->new_it;
+
+    if (ch == NULL) {
+        assert((new_it->it_flags & ITEM_CHUNKED) == 0);
+        /* if free memory, memcpy. clear prev/next/h_bucket */
+        memcpy(new_it, it, cls_size);
+        new_it->prev = 0;
+        new_it->next = 0;
+        new_it->h_next = 0;
+        /* These are definitely required. else fails assert */
+        new_it->it_flags &= ~ITEM_LINKED;
+        new_it->refcount = 0;
+        do_item_replace(it, new_it, a->hv, ITEM_get_cas(it));
+        /* Need to walk the chunks and repoint head  */
+        if (new_it->it_flags & ITEM_CHUNKED) {
+            item_chunk *fch = (item_chunk *) ITEM_schunk(new_it);
+            fch->next->prev = fch;
+            while (fch) {
+                fch->head = new_it;
+                fch = fch->next;
+            }
+        }
+        it->refcount = 0;
+        it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
+#ifdef DEBUG_SLAB_MOVER
+        memcpy(ITEM_key(it), "deadbeef", 8);
+#endif
+        t->rebal.rescues++;
+    } else {
+        item_chunk *nch = (item_chunk *) new_it;
+        /* Chunks always have head chunk (the main it) */
+        ch->prev->next = nch;
+        if (ch->next)
+            ch->next->prev = nch;
+        memcpy(nch, ch, ch->used + sizeof(item_chunk));
+        ch->refcount = 0;
+        ch->it_flags = ITEM_SLABBED|ITEM_FETCHED;
+        t->rebal.chunk_rescues++;
+#ifdef DEBUG_SLAB_MOVER
+        memcpy(ITEM_key((item *)ch), "deadbeef", 8);
+#endif
+        refcount_decr(it);
+    }
+
+    // we've used the temporary memory.
+    t->new_it = NULL;
+}
+
+// try to free up a chunk of memory, if not already free.
+// if we have memory available outside of the source page, rescue any valid
+// items.
+// we still attempt to move data even if no memory is available for a rescue,
+// in case the item is already free, expired, busy, etc.
 static int slab_rebalance_move(struct slab_rebal_thread *t) {
     int was_busy = 0;
     struct _locked_st cbarg;
@@ -232,10 +337,6 @@ static int slab_rebalance_move(struct slab_rebal_thread *t) {
         // it is returned _locked_ if successful. _must_ unlock it!
         int status = slabs_locked_callback(_slabs_locked_cb, &cbarg);
 
-        // FIXME: new_it must be passed in.
-        item *new_it = NULL;
-        int cls_size = t->rebal.cls_size;
-        int save_item = 0;
         item_chunk *ch = cbarg.ch;
         switch (status) {
             case MOVE_FROM_LRU:
@@ -246,62 +347,11 @@ static int slab_rebalance_move(struct slab_rebal_thread *t) {
                  * refcount 1 (just our own, then fall through and wipe it
                  */
                 /* Check if expired or flushed */
-
                 if ((it->exptime != 0 && it->exptime < current_time)
                     || item_is_flushed(it)) {
                     /* Expired, don't save. */
-                    save_item = 0;
-                } else {
-                    /* Was whatever it was, and we have memory for it. */
-                    save_item = 1;
-                }
-                if (save_item) {
-                    if (ch == NULL) {
-                        assert((new_it->it_flags & ITEM_CHUNKED) == 0);
-                        /* if free memory, memcpy. clear prev/next/h_bucket */
-                        memcpy(new_it, it, cls_size);
-                        new_it->prev = 0;
-                        new_it->next = 0;
-                        new_it->h_next = 0;
-                        /* These are definitely required. else fails assert */
-                        new_it->it_flags &= ~ITEM_LINKED;
-                        new_it->refcount = 0;
-                        do_item_replace(it, new_it, cbarg.hv, ITEM_get_cas(it));
-                        /* Need to walk the chunks and repoint head  */
-                        if (new_it->it_flags & ITEM_CHUNKED) {
-                            item_chunk *fch = (item_chunk *) ITEM_schunk(new_it);
-                            fch->next->prev = fch;
-                            while (fch) {
-                                fch->head = new_it;
-                                fch = fch->next;
-                            }
-                        }
-                        it->refcount = 0;
-                        it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
-#ifdef DEBUG_SLAB_MOVER
-                        memcpy(ITEM_key(it), "deadbeef", 8);
-#endif
-                        t->rebal.rescues++;
-                    } else {
-                        item_chunk *nch = (item_chunk *) new_it;
-                        /* Chunks always have head chunk (the main it) */
-                        ch->prev->next = nch;
-                        if (ch->next)
-                            ch->next->prev = nch;
-                        memcpy(nch, ch, ch->used + sizeof(item_chunk));
-                        ch->refcount = 0;
-                        ch->it_flags = ITEM_SLABBED|ITEM_FETCHED;
-                        t->rebal.chunk_rescues++;
-#ifdef DEBUG_SLAB_MOVER
-                        memcpy(ITEM_key((item *)ch), "deadbeef", 8);
-#endif
-                        refcount_decr(it);
-                    }
-                    t->rebal.completed[offset] = 1;
-                } else {
                     /* unlink and mark as done if it's not
                      * a chunked item as they require more book-keeping) */
-                    // FIXME: storage
                     STORAGE_delete(t->storage, it);
                     if (!ch && (it->it_flags & ITEM_CHUNKED) == 0) {
                         do_item_unlink(it, cbarg.hv);
@@ -318,8 +368,21 @@ static int slab_rebalance_move(struct slab_rebal_thread *t) {
                         t->rebal.busy_items++;
                         was_busy++;
                     }
-
+                } else {
+                    // we should try to rescue the item.
+                    if (t->new_it == NULL) {
+                        // we don't actually have memory: need to mark as busy
+                        // and try again in a future loop.
+                        t->rebal.busy_items++;
+                        t->rebal.busy_nomem++;
+                        was_busy++;
+                        refcount_decr(it);
+                    } else {
+                        slab_rebalance_rescue(t, &cbarg);
+                        t->rebal.completed[offset] = 1;
+                    }
                 }
+
                 item_trylock_unlock(cbarg.hold_lock);
                 break;
             case MOVE_FROM_SLAB:
@@ -352,14 +415,13 @@ static int slab_rebalance_move(struct slab_rebal_thread *t) {
                 was_busy++;
                 break;
             case MOVE_PASS:
+                // already freed and unlinked, probably during an alloc
+                t->rebal.completed[offset] = 1;
                 break;
         }
 
     }
 
-    // Note: slab_rebal.* is occasionally protected under slabs_lock, but
-    // the mover thread is the only user while active: so it's only necessary
-    // for start/stop synchronization.
     t->rebal.slab_pos = (char *)t->rebal.slab_pos + t->rebal.cls_size;
 
     if (t->rebal.slab_pos >= t->rebal.slab_end) {
@@ -394,6 +456,12 @@ static void slab_rebalance_finish(struct slab_rebal_thread *t) {
     }
 #endif
 
+    // release any temporary memory we didn't end up using.
+    if (t->new_it) {
+        slabs_free(t->new_it, t->rebal.s_clsid);
+        t->new_it = NULL;
+    }
+
     /* At this point the stolen slab is completely clear.
      * We always kill the "first"/"oldest" slab page in the slab_list, so
      * shuffle the page list backwards and decrement.
@@ -407,6 +475,7 @@ static void slab_rebalance_finish(struct slab_rebal_thread *t) {
     stats.slab_reassign_inline_reclaim += t->rebal.inline_reclaim;
     stats.slab_reassign_chunk_rescues += t->rebal.chunk_rescues;
     stats.slab_reassign_busy_deletes += t->rebal.busy_deletes;
+    // TODO: busy_nomem
     stats_state.slab_reassign_running = false;
     STATS_UNLOCK();
 
@@ -417,6 +486,7 @@ static void slab_rebalance_finish(struct slab_rebal_thread *t) {
 /* Slab mover thread.
  * Sits waiting for a condition to jump off and shovel some memory about
  */
+// TODO: add back the "max busy loops" and bail the page move
 static void *slab_rebalance_thread(void *arg) {
     struct slab_rebal_thread *t = arg;
     struct slab_rebalance *r = &t->rebal;
@@ -436,9 +506,13 @@ static void *slab_rebalance_thread(void *arg) {
                     // TODO: logger
                     r->s_clsid = 0;
                     r->d_clsid = 0;
+                    continue;
                 }
             }
 
+            // attempt to get some prepared memory
+            slab_rebalance_prep(t);
+            // attempt to free up memory in a page
             was_busy = slab_rebalance_move(t);
 
             if (r->done) {
@@ -537,4 +611,11 @@ void stop_slab_maintenance_thread(struct slab_rebal_thread *t) {
 
     /* Wait for the maintenance thread to stop */
     pthread_join(t->tid, NULL);
+
+    pthread_mutex_destroy(&t->lock);
+    pthread_cond_destroy(&t->cond);
+    if (t->rebal.completed) {
+        free(t->rebal.completed);
+    }
+    free(t);
 }
