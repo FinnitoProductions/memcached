@@ -484,7 +484,9 @@ struct settings {
     bool slab_reassign;     /* Whether or not slab reassignment is allowed */
     bool ssl_enabled; /* indicates whether SSL is enabled */
     int slab_automove;     /* Whether or not to automatically move slabs */
+    unsigned int slab_automove_version; /* bump if AM config args change */
     double slab_automove_ratio; /* youngest must be within pct of oldest */
+    double slab_automove_freeratio; /* % of memory to hold free as buffer */
     unsigned int slab_automove_window; /* window mover for algorithm */
     int hashpower_init;     /* Starting hash power level */
     bool shutdown_command; /* allow shutdown command */
@@ -521,7 +523,6 @@ struct settings {
     unsigned int ext_drop_under; /* when fewer than this many pages, drop COLD items */
     unsigned int ext_max_sleep; /* maximum sleep time for extstore bg threads, in us */
     double ext_max_frag; /* ideal maximum page fragmentation */
-    double slab_automove_freeratio; /* % of memory to hold free as buffer */
     bool ext_drop_unread; /* skip unread items during compaction */
     /* start flushing to extstore after memory below this */
     unsigned int ext_global_pool_min;
