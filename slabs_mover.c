@@ -36,7 +36,6 @@ struct slab_rebalance {
 };
 
 struct slab_rebal_thread {
-    int signal;
     bool run_thread;
     void *storage; // extstore instance.
     // TODO: logger instance.
@@ -79,9 +78,6 @@ static int slab_rebalance_start(struct slab_rebal_thread *t) {
     if (t->rebal.s_clsid == SLAB_GLOBAL_PAGE_POOL) {
         t->rebal.done = 1;
     }
-
-    // FIXME: name? wtf does 2 mean?
-    t->signal = 2;
 
     // FIXME: remove this. query the structure from outside to see if we're
     // running.
@@ -416,8 +412,6 @@ static void slab_rebalance_finish(struct slab_rebal_thread *t) {
 
     free(t->rebal.completed);
     memset(&t->rebal, 0, sizeof(t->rebal));
-
-    t->signal = 0;
 }
 
 /* Slab mover thread.
@@ -425,6 +419,7 @@ static void slab_rebalance_finish(struct slab_rebal_thread *t) {
  */
 static void *slab_rebalance_thread(void *arg) {
     struct slab_rebal_thread *t = arg;
+    struct slab_rebalance *r = &t->rebal;
     int was_busy = 0;
     int backoff_timer = 1;
     int backoff_max = 1000;
@@ -432,31 +427,32 @@ static void *slab_rebalance_thread(void *arg) {
     mutex_lock(&t->lock);
 
     /* Must finish moving page before stopping */
-    while (t->signal || t->run_thread) {
-        if (t->signal == 1) {
-            if (slab_rebalance_start(t) < 0) {
-                /* Handle errors with more specificity as required. */
-                t->signal = 0;
+    while (t->run_thread) {
+        // are we running a rebalance?
+        if (r->s_clsid != 0 || r->d_clsid != 0) {
+            // do we need to kick it off?
+            if (r->slab_start == NULL) {
+                if (slab_rebalance_start(t) < 0) {
+                    // TODO: logger
+                    r->s_clsid = 0;
+                    r->d_clsid = 0;
+                }
             }
 
-            was_busy = 0;
-        } else if (t->signal && t->rebal.slab_start != NULL) {
             was_busy = slab_rebalance_move(t);
-        }
 
-        if (t->rebal.done) {
-            slab_rebalance_finish(t);
-        } else if (was_busy) {
-            /* Stuck waiting for some items to unlock, so slow down a bit
-             * to give them a chance to free up */
-            usleep(backoff_timer);
-            backoff_timer = backoff_timer * 2;
-            if (backoff_timer > backoff_max)
-                backoff_timer = backoff_max;
-        }
-
-        if (t->signal == 0) {
-            /* always hold this lock while we're running */
+            if (r->done) {
+                slab_rebalance_finish(t);
+            } else if (was_busy) {
+                /* Stuck waiting for some items to unlock, so slow down a bit
+                 * to give them a chance to free up */
+                usleep(backoff_timer);
+                backoff_timer = backoff_timer * 2;
+                if (backoff_timer > backoff_max)
+                    backoff_timer = backoff_max;
+            }
+        } else {
+            // wait for signal to start another move.
             pthread_cond_wait(&t->cond, &t->lock);
         }
     }
@@ -467,9 +463,6 @@ static void *slab_rebalance_thread(void *arg) {
 }
 
 static enum reassign_result_type do_slabs_reassign(struct slab_rebal_thread *t, int src, int dst) {
-    if (t->signal != 0)
-        return REASSIGN_RUNNING;
-
     if (src == dst)
         return REASSIGN_SRC_DST_SAME;
 
@@ -490,7 +483,6 @@ static enum reassign_result_type do_slabs_reassign(struct slab_rebal_thread *t, 
     t->rebal.s_clsid = src;
     t->rebal.d_clsid = dst;
 
-    t->signal = 1;
     pthread_cond_signal(&t->cond);
 
     return REASSIGN_OK;
