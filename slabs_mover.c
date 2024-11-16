@@ -55,7 +55,7 @@ struct slab_rebal_thread {
 
 enum move_status {
     MOVE_PASS=0, MOVE_FROM_SLAB, MOVE_FROM_LRU, MOVE_BUSY,
-    MOVE_BUSY_UPLOADING, MOVE_BUSY_ACTIVE, MOVE_LOCKED
+    MOVE_BUSY_UPLOADING, MOVE_BUSY_ACTIVE, MOVE_BUSY_FLOATING, MOVE_LOCKED
 };
 
 static slab_automove_reg_t slab_automove_default = {
@@ -234,6 +234,9 @@ static int _slabs_locked_cb(void *arg) {
     /* ITEM_FETCHED when ITEM_SLABBED is overloaded to mean we've cleared
      * the chunk for move. Only these two flags should exist.
      */
+    // TODO: bad failure mode if MOVE_PASS and we decide to skip later
+    // but the item is actually alive for whatever reason.
+    // default to MOVE_BUSY and set MOVE_PASS explicitly if the item is S|F?
     if (it->it_flags != (ITEM_SLABBED|ITEM_FETCHED)) {
         int refcount = 0;
 
@@ -277,7 +280,7 @@ static int _slabs_locked_cb(void *arg) {
         } else {
             /* See above comment. No ITEM_SLABBED or ITEM_LINKED. Mark
              * busy and wait for item to complete its upload. */
-            status = MOVE_BUSY_UPLOADING;
+            status = MOVE_BUSY_FLOATING;
         }
     }
 
@@ -432,6 +435,7 @@ static int slab_rebalance_move(struct slab_rebal_thread *t) {
                 item_trylock_unlock(cbarg.hold_lock);
                 break;
             case MOVE_LOCKED:
+            case MOVE_BUSY_FLOATING:
                 t->rebal.busy_items++;
                 was_busy++;
                 break;
