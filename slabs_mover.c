@@ -265,10 +265,6 @@ static int _slabs_locked_cb(void *arg) {
                 } else if (refcount > 2 && is_linked) {
                     status = MOVE_BUSY_ACTIVE;
                 } else {
-                    if (settings.verbose > 2) {
-                        fprintf(stderr, "Slab reassign hit a busy item: refcount: %d (%d -> %d)\n",
-                            it->refcount, a->s_clsid, a->d_clsid);
-                    }
                     status = MOVE_BUSY;
                 }
             }
@@ -357,6 +353,11 @@ static int slab_rebalance_move(struct slab_rebal_thread *t) {
         int status = slabs_locked_callback(_slabs_locked_cb, &cbarg);
 
         item_chunk *ch = cbarg.ch;
+        if (ch) {
+            // swap item under examination to the chunk head if we're
+            // attempting to move a chunk within a larger item.
+            it = ch->head;
+        }
         switch (status) {
             case MOVE_FROM_LRU:
                 /* Lock order is LRU locks -> slabs_lock. unlink uses LRU lock.
@@ -416,6 +417,7 @@ static int slab_rebalance_move(struct slab_rebal_thread *t) {
             case MOVE_BUSY:
             case MOVE_BUSY_UPLOADING:
             case MOVE_BUSY_ACTIVE:
+                assert(it->refcount != 0);
                 // TODO: for active, replace in place?
                 // for not chunked, same logic as MOVE_FROM_LRU
                 // double check with store_item() for overwriting SET's
