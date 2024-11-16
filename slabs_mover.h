@@ -10,7 +10,8 @@ enum reassign_result_type {
     REASSIGN_SRC_DST_SAME
 };
 
-enum reassign_result_type slabs_reassign(struct slab_rebal_thread *t, int src, int dst);
+#define SLABS_REASSIGN_ALLOW_EVICTIONS 1
+enum reassign_result_type slabs_reassign(struct slab_rebal_thread *t, int src, int dst, int flags);
 
 void slab_maintenance_pause(struct slab_rebal_thread *t);
 void slab_maintenance_resume(struct slab_rebal_thread *t);
