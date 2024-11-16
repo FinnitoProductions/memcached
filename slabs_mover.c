@@ -1,7 +1,4 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
-// IMPORTANT: __NO GLOBALS__ ONCE WORK IS COMPLETE
-// IMPORTANT: MOVE SLAB REBAL ALGO FROM items.c LRU MAINT TO HERE.
-
 #include "memcached.h"
 #include "slabs_mover.h"
 #include "slab_automove.h"
@@ -48,6 +45,7 @@ struct slab_rebal_thread {
     pthread_mutex_t lock;
     pthread_cond_t cond;
     pthread_t tid;
+    logger *l;
     unsigned int am_version; // re-generate am object if version changes
     struct timespec am_last; // last time automover algo ran
     slab_automove_reg_t *sam; // active algorithm module
@@ -533,9 +531,8 @@ static int slab_rebalance_check_automove(struct slab_rebal_thread *t,
     if (src != -1 && dst != -1) {
         // rebalancer lock already held, call directly.
         do_slabs_reassign(t, src, dst);
-        // TODO: need logger instance
         // TODO: log the _result_ of the do_slabs_reassign call as well?
-        // LOGGER_LOG(l, LOG_SYSEVENTS, LOGGER_SLAB_MOVE, NULL, src, dst);
+        LOGGER_LOG(t->l, LOG_SYSEVENTS, LOGGER_SLAB_MOVE, NULL, src, dst);
         if (dst != 0) {
             // if not reclaiming to global, rate limit to one per second.
             t->am_last.tv_sec = now->tv_sec;
@@ -557,6 +554,8 @@ static void *slab_rebalance_thread(void *arg) {
     int was_busy = 0;
     int backoff_timer = 1;
     int backoff_max = 1000;
+    // create logger in thread for setspecific
+    t->l = logger_create();
     /* Go into cond_wait with the mutex held */
     mutex_lock(&t->lock);
 
@@ -574,20 +573,21 @@ static void *slab_rebalance_thread(void *arg) {
                 }
             }
 
-            // attempt to get some prepared memory
-            slab_rebalance_prep(t);
-            // attempt to free up memory in a page
-            was_busy = slab_rebalance_move(t);
-
             if (r->done) {
                 slab_rebalance_finish(t);
-            } else if (was_busy) {
-                /* Stuck waiting for some items to unlock, so slow down a bit
-                 * to give them a chance to free up */
-                usleep(backoff_timer);
-                backoff_timer = backoff_timer * 2;
-                if (backoff_timer > backoff_max)
-                    backoff_timer = backoff_max;
+            } else {
+                // attempt to get some prepared memory
+                slab_rebalance_prep(t);
+                // attempt to free up memory in a page
+                was_busy = slab_rebalance_move(t);
+                if (was_busy) {
+                    /* Stuck waiting for some items to unlock, so slow down a bit
+                     * to give them a chance to free up */
+                    usleep(backoff_timer);
+                    backoff_timer = backoff_timer * 2;
+                    if (backoff_timer > backoff_max)
+                        backoff_timer = backoff_max;
+                }
             }
         } else {
             struct timespec now;
@@ -699,4 +699,6 @@ void stop_slab_maintenance_thread(struct slab_rebal_thread *t) {
     }
     t->sam->free(t->active_am);
     free(t);
+
+    // TODO: there is no logger_destroy() yet.
 }
