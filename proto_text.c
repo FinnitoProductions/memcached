@@ -2634,7 +2634,7 @@ static void process_slabs_command(conn *c, token_t *tokens, const size_t ntokens
             return;
         }
 
-        rv = slabs_reassign(settings.slab_rebal, src, dst);
+        rv = slabs_reassign(settings.slab_rebal, src, dst, SLABS_REASSIGN_ALLOW_EVICTIONS);
         switch (rv) {
         case REASSIGN_OK:
             out_string(c, "OK");

@@ -38,7 +38,7 @@ struct slab_rebalance {
 
 struct slab_rebal_thread {
     bool run_thread;
-    bool mem_full; // all memory alloced and global pool is 0 as of start.
+    bool allow_evictions; // global pool empty or manual page move
     void *storage; // extstore instance.
     item *new_it; // memory for swapping out valid items.
     // TODO: logger instance.
@@ -73,7 +73,7 @@ static slab_automove_reg_t slab_automove_extstore = {
 
 // FIXME: delete if unused
 #define SLAB_MOVE_MAX_LOOPS 1000
-static enum reassign_result_type do_slabs_reassign(struct slab_rebal_thread *t, int src, int dst);
+static enum reassign_result_type do_slabs_reassign(struct slab_rebal_thread *t, int src, int dst, int flags);
 
 static int slab_rebalance_start(struct slab_rebal_thread *t) {
     uint32_t size;
@@ -91,9 +91,7 @@ static int slab_rebalance_start(struct slab_rebal_thread *t) {
     // rare.
     unsigned int global = global_page_pool_size(&mem_limit_reached);
     if (mem_limit_reached && global == 0) {
-        t->mem_full = true;
-    } else {
-        t->mem_full = false;
+        t->allow_evictions = true;
     }
 
     void *page = slabs_peek_page(t->rebal.s_clsid, &size, &perslab);
@@ -156,9 +154,6 @@ static void *slab_rebalance_alloc(struct slab_rebal_thread *t, unsigned int id) 
 }
 
 // To call move, we first need a free chunk of memory.
-// TODO: flag to indicate if the page mover was a manual request.
-// If so, always do an eviction to move forward.
-// - use t->mem_full (rename it?) unless mem_full gets used elsewhere.
 static void slab_rebalance_prep(struct slab_rebal_thread *t) {
     unsigned int s_clsid = t->rebal.s_clsid;
     if (t->new_it) {
@@ -171,7 +166,7 @@ static void slab_rebalance_prep(struct slab_rebal_thread *t) {
     // other memory to work with.
     // We try to busy-loop the page mover at least a few times in this case,
     // so it will pick up on all of the memory being freed already.
-    if (t->new_it == NULL && t->mem_full) {
+    if (t->new_it == NULL && t->allow_evictions) {
         // global is empty and memory limit is reached. we have to evict
         // memory to move forward.
         for (int x = 0; x < 10; x++) {
@@ -506,6 +501,7 @@ static void slab_rebalance_finish(struct slab_rebal_thread *t) {
 
     free(t->rebal.completed);
     memset(&t->rebal, 0, sizeof(t->rebal));
+    t->allow_evictions = false;
 }
 
 static int slab_rebalance_check_automove(struct slab_rebal_thread *t,
@@ -534,9 +530,11 @@ static int slab_rebalance_check_automove(struct slab_rebal_thread *t,
     t->sam->run(t->active_am, &src, &dst);
     if (src != -1 && dst != -1) {
         // rebalancer lock already held, call directly.
-        do_slabs_reassign(t, src, dst);
-        // TODO: log the _result_ of the do_slabs_reassign call as well?
-        LOGGER_LOG(t->l, LOG_SYSEVENTS, LOGGER_SLAB_MOVE, NULL, src, dst);
+        const char *msg = "ok";
+        if (do_slabs_reassign(t, src, dst, 0) != REASSIGN_OK) {
+            msg = "fail";
+        }
+        LOGGER_LOG(t->l, LOG_SYSEVENTS, LOGGER_SLAB_MOVE, NULL, src, dst, msg);
         if (dst != 0) {
             // if not reclaiming to global, rate limit to one per second.
             t->am_last.tv_sec = now->tv_sec;
@@ -610,7 +608,7 @@ static void *slab_rebalance_thread(void *arg) {
     return NULL;
 }
 
-static enum reassign_result_type do_slabs_reassign(struct slab_rebal_thread *t, int src, int dst) {
+static enum reassign_result_type do_slabs_reassign(struct slab_rebal_thread *t, int src, int dst, int flags) {
     if (src == dst)
         return REASSIGN_SRC_DST_SAME;
 
@@ -630,18 +628,21 @@ static enum reassign_result_type do_slabs_reassign(struct slab_rebal_thread *t, 
 
     t->rebal.s_clsid = src;
     t->rebal.d_clsid = dst;
+    if (flags & SLABS_REASSIGN_ALLOW_EVICTIONS) {
+        t->allow_evictions = true;
+    }
 
     pthread_cond_signal(&t->cond);
 
     return REASSIGN_OK;
 }
 
-enum reassign_result_type slabs_reassign(struct slab_rebal_thread *t, int src, int dst) {
+enum reassign_result_type slabs_reassign(struct slab_rebal_thread *t, int src, int dst, int flags) {
     enum reassign_result_type ret;
     if (pthread_mutex_trylock(&t->lock) != 0) {
         return REASSIGN_RUNNING;
     }
-    ret = do_slabs_reassign(t, src, dst);
+    ret = do_slabs_reassign(t, src, dst, flags);
     pthread_mutex_unlock(&t->lock);
     return ret;
 }
