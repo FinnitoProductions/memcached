@@ -612,7 +612,6 @@ static void *slab_rebalance_thread(void *arg) {
             // do we need to kick it off?
             if (r->slab_start == NULL) {
                 if (slab_rebalance_start(t) < 0) {
-                    // TODO: logger
                     r->s_clsid = 0;
                     r->d_clsid = 0;
                     continue;
