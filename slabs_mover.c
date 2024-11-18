@@ -330,13 +330,45 @@ static void slab_rebalance_rescue(struct slab_rebal_thread *t, struct _locked_st
     t->new_it = NULL;
 }
 
+// TODO: in order to rescue active chunked items we need to first do more work
+// on chunked items:
+// - individual chunks need to be refcounted, with refcounts protected by item
+// lock. then they can be swapped out an released on refcount reduction
+// - for chunked item headers I don't know how off-hand.
+static int slab_rebalance_active_rescue(struct slab_rebal_thread *t, struct _locked_st *a) {
+    int cls_size = t->rebal.cls_size;
+    item *it = a->it;
+    item_chunk *ch = a->ch;
+    item *new_it = t->new_it;
+
+    // Can only rescue active non-chunked items right now.
+    if (ch == NULL && (it->it_flags & ITEM_CHUNKED) == 0) {
+        memcpy(new_it, it, cls_size);
+        new_it->prev = 0;
+        new_it->next = 0;
+        new_it->h_next = 0;
+
+        new_it->it_flags &= ~ITEM_LINKED;
+        new_it->refcount = 0;
+        do_item_replace(it, new_it, a->hv, ITEM_get_cas(it));
+        t->rebal.rescues++;
+
+        // old it is now unlinked. can't immediately rescue item.
+        t->new_it = NULL;
+        return 0;
+    }
+
+    // failed to rescue busy item.
+    return 1;
+}
+
 // try to free up a chunk of memory, if not already free.
 // if we have memory available outside of the source page, rescue any valid
 // items.
 // we still attempt to move data even if no memory is available for a rescue,
 // in case the item is already free, expired, busy, etc.
 static int slab_rebalance_move(struct slab_rebal_thread *t) {
-    int was_busy = 0;
+    uint32_t was_busy = t->rebal.busy_items;
     struct _locked_st cbarg;
     memset(&cbarg, 0, sizeof(cbarg));
 
@@ -356,9 +388,10 @@ static int slab_rebalance_move(struct slab_rebal_thread *t) {
         if (ch) {
             // swap item under examination to the chunk head if we're
             // attempting to move a chunk within a larger item.
-            it = ch->head;
+            cbarg.it = it = ch->head;
         }
         switch (status) {
+            case MOVE_BUSY_ACTIVE:
             case MOVE_FROM_LRU:
                 /* Lock order is LRU locks -> slabs_lock. unlink uses LRU lock.
                  * We only need to hold the slabs_lock while initially looking
@@ -370,23 +403,27 @@ static int slab_rebalance_move(struct slab_rebal_thread *t) {
                 if ((it->exptime != 0 && it->exptime < current_time)
                     || item_is_flushed(it)) {
                     /* Expired, don't save. */
-                    /* unlink and mark as done if it's not
-                     * a chunked item as they require more book-keeping) */
                     STORAGE_delete(t->storage, it);
                     if (!ch && (it->it_flags & ITEM_CHUNKED) == 0) {
                         do_item_unlink(it, cbarg.hv);
-                        it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
-                        it->refcount = 0;
+                        if (it->refcount == 1) {
+                            it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
+                            it->refcount = 0;
 #ifdef DEBUG_SLAB_MOVER
-                        memcpy(ITEM_key(it), "deadbeef", 8);
+                            memcpy(ITEM_key(it), "deadbeef", 8);
 #endif
-                        t->rebal.completed[offset] = 1;
+                            t->rebal.completed[offset] = 1;
+                        } else {
+                            // expired, but busy.
+                            do_item_remove(it);
+                            t->rebal.busy_items++;
+                        }
                     } else {
+                        // chunked: unlink it and grab on next loop
+                        // same code regardless of refcount
                         do_item_unlink(it, cbarg.hv);
-                        slabs_free(it, t->rebal.s_clsid);
-                        /* Swing around again later to remove it from the freelist. */
+                        do_item_remove(it);
                         t->rebal.busy_items++;
-                        was_busy++;
                     }
                 } else {
                     // we should try to rescue the item.
@@ -395,11 +432,18 @@ static int slab_rebalance_move(struct slab_rebal_thread *t) {
                         // and try again in a future loop.
                         t->rebal.busy_items++;
                         t->rebal.busy_nomem++;
-                        was_busy++;
                         refcount_decr(it);
                     } else {
-                        slab_rebalance_rescue(t, &cbarg);
-                        t->rebal.completed[offset] = 1;
+                        if (it->refcount == 2) {
+                            slab_rebalance_rescue(t, &cbarg);
+                            t->rebal.completed[offset] = 1;
+                        } else {
+                            assert(it->refcount > 2);
+                            // need to wait for ref'ed owners to free *it
+                            slab_rebalance_active_rescue(t, &cbarg);
+                            t->rebal.busy_items++;
+                            do_item_remove(it);
+                        }
                     }
                 }
 
@@ -416,25 +460,14 @@ static int slab_rebalance_move(struct slab_rebal_thread *t) {
                 break;
             case MOVE_BUSY:
             case MOVE_BUSY_UPLOADING:
-            case MOVE_BUSY_ACTIVE:
                 assert(it->refcount != 0);
-                // TODO: for active, replace in place?
-                // for not chunked, same logic as MOVE_FROM_LRU
-                // double check with store_item() for overwriting SET's
-                // for chunked... more difficult.
-                // SEE: _store_item_copy_chunks|data
-                // from append/prepend/etc code. reusable maybe?
-                // could implement that later as well.
-                // it might be better in the short term to abandon slabs which
-                // are stuck busy without progress, and re-sort the slab page
-                // list before trying again.
+                t->rebal.busy_items++;
                 refcount_decr(it);
                 item_trylock_unlock(cbarg.hold_lock);
                 break;
             case MOVE_LOCKED:
             case MOVE_BUSY_FLOATING:
                 t->rebal.busy_items++;
-                was_busy++;
                 break;
             case MOVE_PASS:
                 // already freed and unlinked, probably during an alloc
@@ -460,7 +493,7 @@ static int slab_rebalance_move(struct slab_rebal_thread *t) {
         }
     }
 
-    return was_busy;
+    return (t->rebal.busy_items != was_busy) ? 1 : 0;
 }
 
 static void slab_rebalance_finish(struct slab_rebal_thread *t) {
@@ -555,7 +588,6 @@ static int slab_rebalance_check_automove(struct slab_rebal_thread *t,
 static void *slab_rebalance_thread(void *arg) {
     struct slab_rebal_thread *t = arg;
     struct slab_rebalance *r = &t->rebal;
-    int was_busy = 0;
     int backoff_timer = 1;
     int backoff_max = 1000;
     // create logger in thread for setspecific
@@ -583,8 +615,7 @@ static void *slab_rebalance_thread(void *arg) {
                 // attempt to get some prepared memory
                 slab_rebalance_prep(t);
                 // attempt to free up memory in a page
-                was_busy = slab_rebalance_move(t);
-                if (was_busy) {
+                if (slab_rebalance_move(t)) {
                     /* Stuck waiting for some items to unlock, so slow down a bit
                      * to give them a chance to free up */
                     usleep(backoff_timer);
