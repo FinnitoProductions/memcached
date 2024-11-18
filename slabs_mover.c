@@ -71,8 +71,8 @@ static slab_automove_reg_t slab_automove_extstore = {
 };
 #endif
 
-// FIXME: delete if unused
-#define SLAB_MOVE_MAX_LOOPS 1000
+// the sleep inbetween loops is short, so 1000 loops is < 1s
+#define SLAB_MOVE_MAX_LOOPS 5000
 static enum reassign_result_type do_slabs_reassign(struct slab_rebal_thread *t, int src, int dst, int flags);
 
 static int slab_rebalance_start(struct slab_rebal_thread *t) {
@@ -356,6 +356,16 @@ static int slab_rebalance_active_rescue(struct slab_rebal_thread *t, struct _loc
         // old it is now unlinked. can't immediately rescue item.
         t->new_it = NULL;
         return 0;
+    } else {
+        // else if chunked, check if we've been busy-waiting too long and
+        // delete the item.
+        if (t->rebal.busy_loops > SLAB_MOVE_MAX_LOOPS) {
+            // TODO: add indicator for source of eviction
+            LOGGER_LOG(t->l, LOG_EVICTIONS, LOGGER_EVICTION, it);
+            STORAGE_delete(t->storage, it);
+            do_item_unlink(it, a->hv);
+            t->rebal.busy_deletes++;
+        }
     }
 
     // failed to rescue busy item.
@@ -530,7 +540,7 @@ static void slab_rebalance_finish(struct slab_rebal_thread *t) {
     stats.slab_reassign_inline_reclaim += t->rebal.inline_reclaim;
     stats.slab_reassign_chunk_rescues += t->rebal.chunk_rescues;
     stats.slab_reassign_busy_deletes += t->rebal.busy_deletes;
-    // TODO: busy_nomem
+    stats.slab_reassign_busy_nomem += t->rebal.busy_nomem;
     stats_state.slab_reassign_running = false;
     STATS_UNLOCK();
 
