@@ -11,8 +11,6 @@
 #include <string.h>
 
 #define MIN_PAGES_FOR_SOURCE 2
-#define MIN_PAGES_FOR_RECLAIM 2.5
-#define MIN_PAGES_FREE 1.5
 
 struct window_data {
     uint64_t age;
@@ -22,6 +20,8 @@ struct window_data {
     unsigned int relaxed;
 };
 
+// TODO: use ptrs for before/after to cut the memcpy
+// after reach run and save some cpu.
 typedef struct {
     struct window_data *window_data;
     struct settings *settings;
@@ -156,7 +156,7 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
         struct window_data *wd = get_window_data(a, n);
         int w_offset = n * a->window_size;
         memset(wd, 0, sizeof(struct window_data));
-        unsigned int free_target = a->sam_after[n].chunks_per_page * MIN_PAGES_FREE;
+        unsigned int free_target = a->sam_after[n].chunks_per_page * MIN_PAGES_FOR_SOURCE;
 
         // if page delta, oom, or evicted delta, mark window dirty
         // classes marked dirty cannot donate memory back to global pool.
@@ -168,9 +168,9 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
         if (a->sam_after[n].total_pages - a->sam_before[n].total_pages > 0) {
             wd->dirty = 1;
         }
-        // double the free requirements means we may have memory we can
-        // reclaim to global, if it stays this way for the whole window.
-        if (a->sam_after[n].free_chunks > (free_target * 2)) {
+
+        // reclaim excessively free memory to global after a full window
+        if (a->sam_after[n].free_chunks > free_target) {
             wd->excess_free = 1;
         } else {
             // not enough free chunks means we were dirty this window.
@@ -184,10 +184,7 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
         memset(&w_sum, 0, sizeof(struct window_data));
         window_sum(&a->window_data[w_offset], &w_sum, a->window_size);
 
-        // grab age as average of window total
-        uint64_t age = w_sum.age / a->window_size;
-
-        // If global page pool is completely empty we need to force a move
+        // If global page pool is nearly empty we need to force a move
         // from any possible source. Otherwise avoid moving from this class if
         // it appears dirty.
         if (w_sum.dirty != 0 && global_count != 0) {
@@ -196,22 +193,17 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
 
         // if > N free chunks, reclaim memory
         // small slab classes aren't age balanced and rely more on global
-        // pool. reclaim them more aggressively.
-        if (a->sam_after[n].free_chunks > a->sam_after[n].chunks_per_page * MIN_PAGES_FOR_RECLAIM) {
-            if (small_slab) {
-                *src = n;
-                *dst = 0;
-                too_free = true;
-            } else if (!small_slab && w_sum.excess_free >= a->window_size) {
-                // If large slab and free chunks haven't decreased for a full
-                // window, reclaim pages.
-                *src = n;
-                *dst = 0;
-                too_free = true;
-            }
+        if (w_sum.excess_free >= a->window_size) {
+            *src = n;
+            *dst = 0;
+            too_free = true;
         }
 
+        // large slabs should push to extstore if we try to evict from them.
+        // so we can be aggressive there if the global pool is low.
         if (!small_slab) {
+            // grab age as average of window total
+            uint64_t age = w_sum.age / a->window_size;
             // if oldest and have enough pages, is oldest
             if (age > oldest_age
                     && a->sam_after[n].total_pages > MIN_PAGES_FOR_SOURCE) {
