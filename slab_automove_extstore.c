@@ -140,6 +140,11 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
     *src = -1;
     *dst = -1;
 
+    // calculate how much memory pressure extstore is under.
+    // 100% means we need to evict item headers.
+    unsigned int total_low_pages = 0;
+    unsigned int total_high_pages = 0;
+
     unsigned int global_count = 0;
     int global_low = global_pool_check(a, &global_count);
     // fill after structs
@@ -157,6 +162,16 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
         int w_offset = n * a->window_size;
         memset(wd, 0, sizeof(struct window_data));
         unsigned int free_target = a->sam_after[n].chunks_per_page * MIN_PAGES_FOR_SOURCE;
+
+        if (small_slab) {
+            total_low_pages += a->sam_after[n].total_pages;
+        } else {
+            unsigned int pages = a->sam_after[n].total_pages;
+            // only include potentially movable pages
+            if (pages > MIN_PAGES_FOR_SOURCE) {
+                total_high_pages += a->sam_after[n].total_pages;
+            }
+        }
 
         // if page delta, oom, or evicted delta, mark window dirty
         // classes marked dirty cannot donate memory back to global pool.
@@ -212,6 +227,13 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
             }
         }
     }
+
+    // update the pressure calculation.
+    float total_pages = total_low_pages + total_high_pages + global_count;
+    float memory_pressure = (total_low_pages / total_pages) * 100;
+    STATS_LOCK();
+    stats_state.extstore_memory_pressure = memory_pressure;
+    STATS_UNLOCK();
 
     memcpy(a->iam_before, a->iam_after,
             sizeof(item_stats_automove) * MAX_NUMBER_OF_SLAB_CLASSES);

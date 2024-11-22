@@ -433,6 +433,7 @@ struct stats_state {
     uint64_t      curr_bytes;
     uint64_t      curr_conns;
     uint64_t      hash_bytes;       /* size used for hash tables */
+    float         extstore_memory_pressure; /* when extstore might memory evict */
     unsigned int  conn_structs;
     unsigned int  reserved_fds;
     unsigned int  hash_power_level; /* Better hope it's not over 9000 */
