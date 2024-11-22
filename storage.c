@@ -110,6 +110,7 @@ void storage_stats(ADD_STAT add_stats, void *c) {
     struct extstore_stats st;
     if (ext_storage) {
         STATS_LOCK();
+        APPEND_STAT("extstore_memory_pressure", "%.2f", stats_state.extstore_memory_pressure);
         APPEND_STAT("extstore_compact_lost", "%llu", (unsigned long long)stats.extstore_compact_lost);
         APPEND_STAT("extstore_compact_rescues", "%llu", (unsigned long long)stats.extstore_compact_rescues);
         APPEND_STAT("extstore_compact_resc_cold", "%llu", (unsigned long long)stats.extstore_compact_resc_cold);
