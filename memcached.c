@@ -259,7 +259,7 @@ static void settings_init(void) {
     settings.slab_automove = 1;
     settings.slab_automove_version = 0;
     settings.slab_automove_ratio = 0.8;
-    settings.slab_automove_window = 30;
+    settings.slab_automove_window = 10;
     settings.shutdown_command = false;
     settings.tail_repair_time = TAIL_REPAIR_TIME_DEFAULT;
     settings.flush_enabled = true;

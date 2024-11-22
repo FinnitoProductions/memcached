@@ -2317,15 +2317,23 @@ static void process_slabs_automove_command(conn *c, token_t *tokens, const size_
             return;
         }
         // TODO: settings needs an overhaul... no locks/etc.
-        settings.slab_automove_version++;
         settings.slab_automove_ratio = ratio;
+        settings.slab_automove_version++;
     } else if (strcmp(tokens[2].value, "freeratio") == 0) {
         if (ntokens < 5 || !safe_strtod(tokens[3].value, &ratio)) {
             out_string(c, "ERROR");
             return;
         }
-        settings.slab_automove_version++;
         settings.slab_automove_freeratio = ratio;
+        settings.slab_automove_version++;
+    } else if (strcmp(tokens[2].value, "window") == 0) {
+        if (ntokens < 5 || !safe_strtoul(tokens[3].value, (uint32_t*)&level)) {
+            out_string(c, "CLIENT_ERROR bad command line format");
+            return;
+        }
+
+        settings.slab_automove_window = level;
+        settings.slab_automove_version++;
     } else {
         if (!safe_strtoul(tokens[2].value, (uint32_t*)&level)) {
             out_string(c, "CLIENT_ERROR bad command line format");
