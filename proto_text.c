@@ -2301,6 +2301,37 @@ static void process_debugtime_command(conn *c, token_t *tokens, const size_t nto
     }
     out_string(c, "OK");
 }
+
+static void process_debugitem_command(conn *c, token_t *tokens, const size_t ntokens) {
+    if (strcmp(tokens[1].value, "lock") == 0) {
+        uint32_t hv = hash(tokens[2].value, tokens[2].length);
+        item_lock(hv);
+    } else if (strcmp(tokens[1].value, "unlock") == 0) {
+        uint32_t hv = hash(tokens[2].value, tokens[2].length);
+        item_unlock(hv);
+    } else if (strcmp(tokens[1].value, "ref") == 0) {
+        // intentionally leak a reference.
+        item *it = item_get(tokens[2].value, tokens[2].length, c->thread, DONT_UPDATE);
+        if (it == NULL) {
+            out_string(c, "MISS");
+            return;
+        }
+    } else if (strcmp(tokens[1].value, "unref") == 0) {
+        // double unlink. debugger must have already ref'ed it or this
+        // underflows.
+        item *it = item_get(tokens[2].value, tokens[2].length, c->thread, DONT_UPDATE);
+        if (it == NULL) {
+            out_string(c, "MISS");
+            return;
+        }
+        do_item_remove(it);
+        do_item_remove(it);
+    } else {
+        out_string(c, "ERROR");
+        return;
+    }
+    out_string(c, "OK");
+}
 #endif
 
 static void process_slabs_automove_command(conn *c, token_t *tokens, const size_t ntokens) {
@@ -2975,6 +3006,9 @@ void process_command_ascii(conn *c, char *command) {
         } else if (strcmp(tokens[COMMAND_TOKEN].value, "debugtime") == 0) {
             WANT_TOKENS_MIN(ntokens, 2);
             process_debugtime_command(c, tokens, ntokens);
+        } else if (strcmp(tokens[COMMAND_TOKEN].value, "debugitem") == 0) {
+            WANT_TOKENS_MIN(ntokens, 2);
+            process_debugitem_command(c, tokens, ntokens);
 #endif
         } else {
             out_string(c, "ERROR");
