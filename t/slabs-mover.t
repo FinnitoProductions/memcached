@@ -17,9 +17,74 @@ my $sock = $server->sock;
     subtest 'syntax' => \&test_syntax;
     subtest 'fill and move pages' => \&test_fill;
     subtest 'chunked items' => \&test_chunked;
-    # test locked items
+    # test moving expired items (chunked + not chunked)
+    # - turn off crawler/juggler?
+    subtest 'test locked' => \&test_locked;
     # test reflocked items and busy looping
     # test reflocked chunked items (ensure busy_deletes)
+}
+
+# TODO: figure a function for the move waiter
+# start with sleep of 0.01 and add 1/100 for each loop. loop for 200
+# also ensure slabs_moved incr'ed at end of loop...
+# update rest of subs
+# use debugitem command to deliberately hang the page mover
+sub test_locked {
+    my $size = 9000;
+    my $bigdata = 'x' x $size;
+    my $stats;
+    my $count = 1;
+    $stats = mem_stats($sock);
+    for (1 .. 10000) {
+        print $sock "set lfoo$_ 0 0 $size\r\n", $bigdata, "\r\n";
+        is(scalar <$sock>, "STORED\r\n", "stored big key");
+        my $s_after = mem_stats($sock);
+        last if ($s_after->{evictions} > $stats->{evictions});
+        $count++;
+    }
+
+    my $s = mem_stats($sock, 'slabs');
+    my $sid = 0;
+    my $total_pages = 0;
+    # Find the highest ID to source from.
+    for my $k (keys %$s) {
+        next unless $k =~ m/^(\d+):total_pages/;
+        if ($s->{$k} > $total_pages) {
+            $sid = $1;
+            $total_pages = $s->{$k};
+        }
+    }
+
+    print $sock "debugitem lock lfoo50\r\n";
+    is(scalar <$sock>, "OK\r\n", "locked item");
+
+    $stats = mem_stats($sock);
+    print $sock "slabs reassign $sid 0\r\n";
+    is(scalar <$sock>, "OK\r\n", "reassign started");
+    my $stats_a;
+    for (1 .. 20) {
+        $stats_a = mem_stats($sock);
+        last if ($stats_a->{slab_reassign_busy_items} > $stats->{slab_reassign_busy_items}+500);
+        sleep 0.25;
+    }
+    cmp_ok($stats_a->{slab_reassign_busy_items}, '>', $stats->{slab_reassign_busy_items}+500, "page mover busy");
+    cmp_ok($stats_a->{slabs_moved}, '==', $stats->{slabs_moved}, "no page moved");
+    is($stats_a->{slab_reassign_running}, 1, "reassign stuck running");
+
+    print $sock "debugitem unlock lfoo50\r\n";
+    is(scalar <$sock>, "OK\r\n", "unlocked item");
+
+    for (1 .. 20) {
+        $stats_a = mem_stats($sock);
+        last if ($stats_a->{slabs_moved} > $stats->{slabs_moved});
+        sleep 0.25;
+    }
+    cmp_ok($stats_a->{slabs_moved}, '>', $stats->{slabs_moved}, "page moved");
+    is($stats_a->{slab_reassign_running}, 0, "reassign stopped running");
+
+    empty_class(mem_stats($sock), $sid);
+    $stats = mem_stats($sock);
+    cmp_ok($stats->{slab_global_page_pool}, '>', 5, "pages back in global pool");
 }
 
 sub test_chunked {
@@ -68,7 +133,34 @@ sub test_chunked {
     cmp_ok($stats_a->{evictions}, '>', $stats->{evictions}, "page move caused some evictions: " . ($stats_a->{evictions} - $stats->{evictions}));
 
     # delete at least a page worth so we can test rescuing data
-    # NOTE: check for free_chunks first
+    $s = mem_stats($sock, 'slabs');
+    cmp_ok($s->{"$sid:free_chunks"}, '<', 5, "few free chunks available to start");
+    cmp_ok($stats->{slab_reassign_chunk_rescues}, '<', 1, 'few chunk rescues happened');
+    my $todelete = int((1024 * 1024) / $size)+1;
+    for (0 .. $todelete) {
+        # delete from the newest since we move the oldest page.
+        # encourages chunk rescues.
+        my $i = $count - $_;
+        print $sock "delete cfoo$i\r\n";
+        is(scalar <$sock>, "DELETED\r\n", "deleted cfoo$i");
+    }
+
+    $stats = mem_stats($sock);
+    print $sock "slabs reassign $sid 0\r\n";
+    for (1 .. 20) {
+        $stats_a = mem_stats($sock);
+        last if ($stats_a->{slabs_moved} > $stats->{slabs_moved});
+        sleep 0.25;
+    }
+
+    cmp_ok($stats_a->{slab_reassign_chunk_rescues}, '>', 50, 'more chunk rescues happened');
+    cmp_ok($stats_a->{slab_reassign_busy_deletes}, '==', $stats->{slab_reassign_busy_deletes}, 'no busy deletes');
+
+    # TODO: fetch all items back and check value
+
+    empty_class(mem_stats($sock), $sid);
+    $stats = mem_stats($sock);
+    cmp_ok($stats->{slab_global_page_pool}, '>', 6, "pages back in global pool");
 }
 
 # Fill test, no chunked items.
