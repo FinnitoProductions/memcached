@@ -187,9 +187,6 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
         // reclaim excessively free memory to global after a full window
         if (a->sam_after[n].free_chunks > free_target) {
             wd->excess_free = 1;
-        } else {
-            // not enough free chunks means we were dirty this window.
-            wd->dirty = 1;
         }
 
         // set age into window
