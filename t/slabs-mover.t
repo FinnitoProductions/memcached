@@ -24,10 +24,22 @@ my $sock = $server->sock;
     # test reflocked chunked items (ensure busy_deletes)
 }
 
-# TODO: figure a function for the move waiter
-# start with sleep of 0.01 and add 1/100 for each loop. loop for 200
-# also ensure slabs_moved incr'ed at end of loop...
-# update rest of subs
+sub wait_for_stat_incr {
+    my $stats = shift;
+    my $stat = shift;
+    my $amt = shift; # 0 is valid
+
+    my $stats_a;
+    my $to_sleep = 0.01;
+    for my $cnt (1 .. 500) {
+        $stats_a = mem_stats($sock);
+        last if ($stats_a->{$stat} > $stats->{$stat}+$amt);
+        sleep $to_sleep;
+        $to_sleep += $cnt / 100;
+    }
+    return $stats_a;
+}
+
 # use debugitem command to deliberately hang the page mover
 sub test_locked {
     my $size = 9000;
@@ -61,12 +73,8 @@ sub test_locked {
     $stats = mem_stats($sock);
     print $sock "slabs reassign $sid 0\r\n";
     is(scalar <$sock>, "OK\r\n", "reassign started");
-    my $stats_a;
-    for (1 .. 20) {
-        $stats_a = mem_stats($sock);
-        last if ($stats_a->{slab_reassign_busy_items} > $stats->{slab_reassign_busy_items}+500);
-        sleep 0.25;
-    }
+    my $stats_a = wait_for_stat_incr($stats, "slab_reassign_busy_items", 500);
+
     cmp_ok($stats_a->{slab_reassign_busy_items}, '>', $stats->{slab_reassign_busy_items}+500, "page mover busy");
     cmp_ok($stats_a->{slabs_moved}, '==', $stats->{slabs_moved}, "no page moved");
     is($stats_a->{slab_reassign_running}, 1, "reassign stuck running");
@@ -74,11 +82,7 @@ sub test_locked {
     print $sock "debugitem unlock lfoo50\r\n";
     is(scalar <$sock>, "OK\r\n", "unlocked item");
 
-    for (1 .. 20) {
-        $stats_a = mem_stats($sock);
-        last if ($stats_a->{slabs_moved} > $stats->{slabs_moved});
-        sleep 0.25;
-    }
+    $stats_a = wait_for_stat_incr($stats, "slabs_moved", 0);
     cmp_ok($stats_a->{slabs_moved}, '>', $stats->{slabs_moved}, "page moved");
     is($stats_a->{slab_reassign_running}, 0, "reassign stopped running");
 
@@ -124,12 +128,7 @@ sub test_chunked {
 
     # move one page while full to force evictions
     print $sock "slabs reassign $sid 0\r\n";
-    my $stats_a;
-    for (1 .. 20) {
-        $stats_a = mem_stats($sock);
-        last if ($stats_a->{slabs_moved} > $stats->{slabs_moved});
-        sleep 0.25;
-    }
+    my $stats_a = wait_for_stat_incr($stats, "slabs_moved", 0);
     cmp_ok($stats_a->{evictions}, '>', $stats->{evictions}, "page move caused some evictions: " . ($stats_a->{evictions} - $stats->{evictions}));
 
     # delete at least a page worth so we can test rescuing data
@@ -147,11 +146,7 @@ sub test_chunked {
 
     $stats = mem_stats($sock);
     print $sock "slabs reassign $sid 0\r\n";
-    for (1 .. 20) {
-        $stats_a = mem_stats($sock);
-        last if ($stats_a->{slabs_moved} > $stats->{slabs_moved});
-        sleep 0.25;
-    }
+    $stats_a = wait_for_stat_incr($stats, "slabs_moved", 0);
 
     cmp_ok($stats_a->{slab_reassign_chunk_rescues}, '>', 50, 'more chunk rescues happened');
     cmp_ok($stats_a->{slab_reassign_busy_deletes}, '==', $stats->{slab_reassign_busy_deletes}, 'no busy deletes');
@@ -200,11 +195,7 @@ sub test_fill {
     print $sock "slabs reassign $cls_big $cls_small\r\n";
     is(scalar <$sock>, "OK\r\n", "slab rebalancer started: $cls_big -> $cls_small");
 
-    for (1 .. 20) {
-        $stats = mem_stats($sock);
-        last if ($stats->{slabs_moved} != 0);
-        sleep 0.25;
-    }
+    my $stats = wait_for_stat_incr($stats, "slabs_moved", 0);
 
     isnt($stats->{slabs_moved}, 0, "slab moved within time limit");
     my $slabs_after = mem_stats($sock, "slabs");
@@ -223,11 +214,7 @@ sub test_fill {
     print $sock "slabs reassign $cls_big $cls_small\r\n";
     is(scalar <$sock>, "OK\r\n", "slab rebalancer started: $cls_big -> $cls_small");
 
-    for (1 .. 20) {
-        $stats_after = mem_stats($sock);
-        last if ($stats_after->{slabs_moved} != $stats->{slabs_moved});
-        sleep 0.25;
-    }
+    $stats_after = wait_for_stat_incr($stats, "slabs_moved", 0);
 
     cmp_ok($stats_after->{slabs_moved}, '>', $stats->{slabs_moved}, 'moved another page');
 
@@ -253,11 +240,7 @@ sub empty_class {
             last;
         }
         is($res, "OK\r\n", "slab rebalancer started: $cls -> 0");
-        for (1 .. 20) {
-            $stats_after = mem_stats($sock);
-            last if ($stats_after->{slabs_moved} > $stats->{slabs_moved});
-            sleep 0.25;
-        }
+        $stats_after = wait_for_stat_incr($stats, "slabs_moved", 0);
     }
 }
 
