@@ -10,16 +10,16 @@ use Data::Dumper qw/Dumper/;
 
 # Enable manual slab reassign, cap at 6 slabs
 # Items above 16kb are chunked
-my $server = new_memcached('-o slab_reassign,slab_automove=0,slab_chunk_max=16 -m 12');
+# disable LRU crawler so we can be sure to move expired items
+my $server = new_memcached('-o no_lru_crawler,slab_reassign,slab_automove=0,slab_chunk_max=16 -m 12');
 my $sock = $server->sock;
 
 {
     subtest 'syntax' => \&test_syntax;
     subtest 'fill and move pages' => \&test_fill;
     subtest 'chunked items' => \&test_chunked;
-    # test moving expired items (chunked + not chunked)
-    # - turn off crawler/juggler?
     subtest 'test locked' => \&test_locked;
+    subtest 'expired items' => \&test_expired;
     # test reflocked items and busy looping
     # test reflocked chunked items (ensure busy_deletes)
 }
@@ -40,7 +40,48 @@ sub wait_for_stat_incr {
     return $stats_a;
 }
 
+sub test_expired {
+    my $size = 9000;
+    my $bigdata = 'x' x $size;
+    my $stats;
+    my $count = 1;
+    $stats = mem_stats($sock);
+    for my $c (1 .. 10000) {
+        my $exp = $c % 2 == 1 ? "T0" : "T1";
+        print $sock "ms efoo$c $size $exp\r\n", $bigdata, "\r\n";
+        is(scalar <$sock>, "HD\r\n", "stored big key");
+        my $s_after = mem_stats($sock);
+        last if ($s_after->{evictions} > $stats->{evictions});
+        $count++;
+    }
+
+    # TODO: use debugtime to move clock and avoid having to sleep.
+    sleep 2;
+
+    # TODO: move to func. repeated a couple times.
+    my $s = mem_stats($sock, 'slabs');
+    my $sid = 0;
+    my $total_pages = 0;
+    # Find the highest ID to source from.
+    for my $k (keys %$s) {
+        next unless $k =~ m/^(\d+):total_pages/;
+        if ($s->{$k} > $total_pages) {
+            $sid = $1;
+            $total_pages = $s->{$k};
+        }
+    }
+
+    $stats = mem_stats($sock);
+    empty_class(mem_stats($sock), $sid);
+
+    my $stats_a = mem_stats($sock);
+    # TODO: there's no counter for "expired items reaped"
+}
+
 # use debugitem command to deliberately hang the page mover
+# NOTE: test is slightly flaky since we have to pick an item to lock that's in
+# the page we want to move. this won't normally change but could if you
+# re-order the tests.
 sub test_locked {
     my $size = 9000;
     my $bigdata = 'x' x $size;
@@ -195,7 +236,7 @@ sub test_fill {
     print $sock "slabs reassign $cls_big $cls_small\r\n";
     is(scalar <$sock>, "OK\r\n", "slab rebalancer started: $cls_big -> $cls_small");
 
-    my $stats = wait_for_stat_incr($stats, "slabs_moved", 0);
+    $stats = wait_for_stat_incr($stats, "slabs_moved", 0);
 
     isnt($stats->{slabs_moved}, 0, "slab moved within time limit");
     my $slabs_after = mem_stats($sock, "slabs");
