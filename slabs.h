@@ -51,7 +51,7 @@ void slabs_munlock(void);
 
 /* utilities for page moving */
 void *slabs_peek_page(const unsigned int id, uint32_t *size, uint32_t *perslab);
-void slabs_unlink_free_chunk(const unsigned int id, item *it);
+void do_slabs_unlink_free_chunk(const unsigned int id, item *it);
 void slabs_finalize_page_move(const unsigned int sid, const unsigned int did, void *page);
 int slabs_pick_any_for_reassign(const unsigned int did);
 int slabs_page_count(const unsigned int id);

@@ -238,6 +238,10 @@ static int _slabs_locked_cb(void *arg) {
         /* ITEM_SLABBED can only be added/removed under the slabs_lock */
         if (it->it_flags & ITEM_SLABBED) {
             assert(a->ch == NULL);
+            // must unlink our free item while slab lock held.
+            // since we don't have an item lock to cover us.
+            do_slabs_unlink_free_chunk(a->s_clsid, it);
+            it->it_flags = 0; // fix flags outside of the slab lock.
             status = MOVE_FROM_SLAB;
         } else if ((it->it_flags & ITEM_LINKED) != 0) {
             /* If it doesn't have ITEM_SLABBED, the item could be in any
@@ -460,7 +464,6 @@ static int slab_rebalance_move(struct slab_rebal_thread *t) {
                 item_trylock_unlock(cbarg.hold_lock);
                 break;
             case MOVE_FROM_SLAB:
-                slabs_unlink_free_chunk(t->rebal.s_clsid, it);
                 it->refcount = 0;
                 it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
 #ifdef DEBUG_SLAB_MOVER

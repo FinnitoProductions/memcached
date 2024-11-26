@@ -728,11 +728,10 @@ void *slabs_peek_page(const unsigned int id, uint32_t *size, uint32_t *perslab) 
 }
 
 /* detaches item/chunk from freelist.
- * for use with page mover
+ * for use with page mover.
+ * lock _must_ be held.
  */
-void slabs_unlink_free_chunk(const unsigned int id, item *it) {
-    pthread_mutex_lock(&slabs_lock);
-
+void do_slabs_unlink_free_chunk(const unsigned int id, item *it) {
     slabclass_t *s_cls = &slabclass[id];
     /* Ensure this was on the freelist and nothing else. */
     assert(it->it_flags == ITEM_SLABBED);
@@ -742,8 +741,6 @@ void slabs_unlink_free_chunk(const unsigned int id, item *it) {
     if (it->next) it->next->prev = it->prev;
     if (it->prev) it->prev->next = it->next;
     s_cls->sl_curr--;
-
-    pthread_mutex_unlock(&slabs_lock);
 }
 
 void slabs_finalize_page_move(const unsigned int sid, const unsigned int did, void *page) {
