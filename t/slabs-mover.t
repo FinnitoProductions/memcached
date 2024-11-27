@@ -20,7 +20,10 @@ my $sock = $server->sock;
     subtest 'chunked items' => \&test_chunked;
     subtest 'test locked' => \&test_locked;
     subtest 'expired items' => \&test_expired;
-    # test reflocked items and busy looping
+    # Need clean memory for the reflock tests
+    print $sock "flush_all\r\n";
+    is(scalar <$sock>, "OK\r\n", "flushed items before reflock test");
+    subtest 'reflocked items' => \&test_reflocked;
     # test reflocked chunked items (ensure busy_deletes)
 }
 
@@ -36,29 +39,12 @@ sub wait_for_stat_incr {
         last if ($stats_a->{$stat} > $stats->{$stat}+$amt);
         sleep $to_sleep;
         $to_sleep += $cnt / 100;
+        #print STDERR Dumper(map { $_ => $stats_a->{$_} } sort keys %$stats_a), "\n";
     }
     return $stats_a;
 }
 
-sub test_expired {
-    my $size = 9000;
-    my $bigdata = 'x' x $size;
-    my $stats;
-    my $count = 1;
-    $stats = mem_stats($sock);
-    for my $c (1 .. 10000) {
-        my $exp = $c % 2 == 1 ? "T0" : "T1";
-        print $sock "ms efoo$c $size $exp\r\n", $bigdata, "\r\n";
-        is(scalar <$sock>, "HD\r\n", "stored big key");
-        my $s_after = mem_stats($sock);
-        last if ($s_after->{evictions} > $stats->{evictions});
-        $count++;
-    }
-
-    # TODO: use debugtime to move clock and avoid having to sleep.
-    sleep 2;
-
-    # TODO: move to func. repeated a couple times.
+sub find_largest_clsid {
     my $s = mem_stats($sock, 'slabs');
     my $sid = 0;
     my $total_pages = 0;
@@ -70,12 +56,89 @@ sub test_expired {
             $total_pages = $s->{$k};
         }
     }
+    return $sid;
+}
+
+# NOTE: Can't validate reflocked items in an integration test since we leak
+# the memory and cannot de-ref an unlinked item.
+# TODO: test reflocked chunked items as well
+sub test_reflocked {
+    my $size = 9000;
+    my $bigdata = 'x' x $size;
+    my $stats;
+    my $count = 1;
+    $stats = mem_stats($sock);
+    for my $c (1 .. 10000) {
+        my $exp = $c % 2 == 1 ? "T0" : "T30";
+        print $sock "ms rfoo$c $size $exp\r\n", $bigdata, "\r\n";
+        is(scalar <$sock>, "HD\r\n", "stored big key: $c [$exp]");
+        my $s_after = mem_stats($sock);
+        last if ($s_after->{evictions} > $stats->{evictions});
+        $count++;
+    }
+
+    # delete one page worth so we have memory to work with to move pages
+    # non-destructively.
+    my $todelete = int((1024 * 1024) / $size)+1;
+    for (0 .. $todelete) {
+        # delete from the newest since we move the oldest page.
+        # encourages chunk rescues.
+        my $i = $count - $_;
+        print $sock "delete rfoo$i\r\n";
+        is(scalar <$sock>, "DELETED\r\n", "deleted rfoo$i");
+    }
+
+    # attempt to reflock a bunch so we hit both expired and active rescue
+    for (2 .. $count - ($todelete+1)) {
+        print $sock "debugitem ref rfoo$_\r\n";
+        is(scalar <$sock>, "OK\r\n", "reflocked rfoo$_");
+    }
+
+    mem_move_time($sock, 60);
+
+    my $sid = find_largest_clsid($sock);
+
+    $stats = mem_stats($sock);
+    print $sock "slabs reassign $sid 0\r\n";
+    is(scalar <$sock>, "OK\r\n", "reassign started");
+    my $stats_a = wait_for_stat_incr($stats, "slab_reassign_busy_items", 500);
+
+    cmp_ok($stats_a->{slab_reassign_busy_items}, '>', $stats->{slab_reassign_busy_items}+500, "page mover busy");
+    # TODO: rescue counter is only updated after a page completes moving.
+    #cmp_ok($stats_a->{slab_reassign_rescues}, '>', $stats->{slab_reassign_rescues}+50, "page mover rescued data");
+    cmp_ok($stats_a->{slabs_moved}, '==', $stats->{slabs_moved}, "no page moved");
+
+}
+
+# TODO: reflock some items so we hit the "expired but reflocked" path
+# TODO: use debugtime to move clock and avoid having to sleep.
+# - also so we can reflock some items without having a race condition by
+# setting the expire time out a minute/hour.
+sub test_expired {
+    my $size = 9000;
+    my $bigdata = 'x' x $size;
+    my $stats;
+    my $count = 1;
+    $stats = mem_stats($sock);
+    for my $c (1 .. 10000) {
+        my $exp = $c % 2 == 1 ? "T0" : "T30";
+        print $sock "ms efoo$c $size $exp\r\n", $bigdata, "\r\n";
+        is(scalar <$sock>, "HD\r\n", "stored big key");
+        my $s_after = mem_stats($sock);
+        last if ($s_after->{evictions} > $stats->{evictions});
+        $count++;
+    }
+
+    mem_move_time($sock, 60);
+
+    my $sid = find_largest_clsid($sock);
 
     $stats = mem_stats($sock);
     empty_class(mem_stats($sock), $sid);
 
     my $stats_a = mem_stats($sock);
     # TODO: there's no counter for "expired items reaped"
+    # if we get here we at least didn't crash though.
 }
 
 # use debugitem command to deliberately hang the page mover
