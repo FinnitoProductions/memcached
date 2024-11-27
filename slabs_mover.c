@@ -634,6 +634,8 @@ static void *slab_rebalance_thread(void *arg) {
                     backoff_timer = backoff_timer * 2;
                     if (backoff_timer > backoff_max)
                         backoff_timer = backoff_max;
+                } else {
+                    backoff_timer = 1;
                 }
             }
         } else {
