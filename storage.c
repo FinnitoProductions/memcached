@@ -618,17 +618,6 @@ static void *storage_write_thread(void *arg) {
         int target_pages = 0;
         if (global_pages < settings.ext_global_pool_min) {
             target_pages = settings.ext_global_pool_min - global_pages;
-            // make sure there's room in each class but don't over-flush.
-            // ie: we're going to want to move pages from the class with the
-            // "oldest" items, but this thread has no way of getting that info
-            // up-to-date. So we just free some pages in all active classes
-            // and let the page mover free stuff up.
-            // However, if the target delta is large (100+ megs) we can end up
-            // flushing gigabytes of data across many classes.
-            // Thus, we clamp the target here.
-            if (target_pages > 5) {
-                target_pages = 5;
-            }
         }
         counter++;
         if (to_sleep > settings.ext_max_sleep)

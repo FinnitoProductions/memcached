@@ -175,13 +175,15 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
 
         // if page delta, oom, or evicted delta, mark window dirty
         // classes marked dirty cannot donate memory back to global pool.
-        if (a->iam_after[n].evicted - a->iam_before[n].evicted > 0 ||
-            a->iam_after[n].outofmemory - a->iam_before[n].outofmemory > 0) {
-            wd->evicted = 1;
-            wd->dirty = 1;
-        }
-        if (a->sam_after[n].total_pages - a->sam_before[n].total_pages > 0) {
-            wd->dirty = 1;
+        if (small_slab) {
+            if (a->iam_after[n].evicted - a->iam_before[n].evicted > 0 ||
+                a->iam_after[n].outofmemory - a->iam_before[n].outofmemory > 0) {
+                wd->evicted = 1;
+                wd->dirty = 1;
+            }
+            if (a->sam_after[n].total_pages - a->sam_before[n].total_pages > 0) {
+                wd->dirty = 1;
+            }
         }
 
         // reclaim excessively free memory to global after a full window
